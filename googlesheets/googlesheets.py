@@ -13,6 +13,7 @@ import time
 from pprint import pprint
 import pandas
 import datetime
+from dateutil.relativedelta import relativedelta
 import re
 
 from gmail_attachments.sendgrid_email import sendgridMail
@@ -20,28 +21,24 @@ from gmail_attachments.sendgrid_email import sendgridMail
 # If modifying these scopes, delete the file token.pickle.
 SHEETS_SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly','https://www.googleapis.com/auth/spreadsheets']
 DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive','https://www.googleapis.com/auth/drive.file']
-# The ID and range of a sample spreadsheet.
-# SAMPLE_SPREADSHEET_ID = '1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms'
-# SAMPLE_RANGE_NAME = 'Class Data!A2:E'
 
 class GoogleSheets:
 
-    def __init__(self, report, end_date):
+    def __init__(self, report, start_date, end_date):
             self.key = env.get("KEY","cw-web-prod-ad-manager.json")
             self.folder = env.get("SHARE_FOLDER")
-            self.placementmap_spreadsheet_id = env.get("placementmap_spreadsheet_id")
-            self.template_spreadsheet_id = env.get("template_spreadsheet_id")
-            self.template_sheet_id = env.get("template_sheet_id")
             
             self.service = None
             self.sendgridMail = sendgridMail()
             
             self.report = report
             self.end_date = end_date
+            self.start_date = start_date
 
+            self.template_spreadsheet_id = env.get("template_spreadsheet_id")
+            self.template_sheet_id = env.get("template_sheet_id")
             self.start_row = 8
             self.default_template_total_row = 299
-            self.column_df = self.default_template_sheet_column()
             pass
    
     def cert(self, SCOPES):
@@ -62,11 +59,14 @@ class GoogleSheets:
         params = args[0]
         
         if len(self.report) == 0:
-            self.send_fail_mail(params["order_id"], params["trafficker_email"])
+            spreadsheet_url = None
+            new_trafficker_email = None
+            #self.send_fail_mail(params["order_id"], params["trafficker_email"])
         
         else:
             campaign, campaign_count = self.count_campaign(self.report)
-            create_spreadsheet_id = self.create_spreadsheet(self.report, self.end_date)
+            create_spreadsheet_id = self.create_spreadsheet(self.report, self.start_date, self.end_date)
+            column_df = self.default_template_sheet_column()
 
             for i in range(campaign_count):
 
@@ -78,34 +78,43 @@ class GoogleSheets:
                 campaign_report = self.get_campaign_report(self.report, campaign[i])
                 
                 # 整理每個活動的報表的日期
-                early_day, days, months = self.campaign_month_count(campaign_report)
+                month_list, early_day, days, months = self.campaign_month_count(campaign_report)
 
                 # 填入 版位名稱、走期
-                placement_index_df, last_column_index, update_data1 = self.fill_campaign_data(self.column_df, campaign_report, early_day, days)
+                placement_index_df, last_column_index, update_data1 = self.fill_campaign_data(column_df, campaign_report, early_day, days)
                 self.update_values(create_spreadsheet_id, update_data1)
                 
                 # 填入日期、數據、總和
                 for k in range(months):
-                    update_data2, total_start_index, last_row_index = self.fill_month_campaign_data(self.column_df, placement_index_df, campaign_report, early_day, k, days, self.start_row) 
-                    self.copy_total_three_rows(create_spreadsheet_id, sheet_id, total_start_index)
-                    self.update_values(create_spreadsheet_id, update_data2)    
-                    self.default_template_total_row += 3          
+                    cur_month = (early_day + relativedelta(months=k)).month
+                    if cur_month not in month_list:
+                        pass
+                    else: 
+                        update_data2, total_start_index, last_row_index = self.fill_month_campaign_data(column_df, placement_index_df, campaign_report, cur_month, early_day, days, self.start_row) 
+                        self.copy_total_three_rows(create_spreadsheet_id, sheet_id, total_start_index)
+                        self.update_values(create_spreadsheet_id, update_data2)    
+                        self.default_template_total_row += 3          
                 self.delete_empty_cols_rows(create_spreadsheet_id, sheet_id, last_column_index, last_row_index)    
                 self.start_row = 8
 
             self.delete_first_sheet(create_spreadsheet_id)
-            create_spreadsheet_url = self.get_url(create_spreadsheet_id)
+            spreadsheet_url = self.get_url(create_spreadsheet_id)
             
             # 產出的報表放進google共用雲端資料夾
             self.cert(DRIVE_SCOPES)
             self.move_to_folder(self.folder, create_spreadsheet_id)
-            self.send_successful_mail(params["order_id"], self.report, create_spreadsheet_url, params["trafficker_email"])
+            new_trafficker_email = self.clean_trafficker_email(self.report, params["trafficker_email"])
+        
+        return spreadsheet_url, new_trafficker_email
+            #self.send_successful_mail(params["order_id"], self.report, create_spreadsheet_url, params["trafficker_email"])
       
-    def create_spreadsheet(self, report, end_date):
+    def create_spreadsheet(self, report, start_date, end_date):
         
         format_end_date = end_date.strftime("%Y%m%d")
+        format_start_date = start_date.strftime("%Y%m%d")
+        now = datetime.date.today().strftime("%Y%m%d")
 
-        spreadsheet_name = format_end_date + '_' + str(report["Dimension.ORDER_NAME"][0]) + '_成效' 
+        spreadsheet_name = now + "_" + str(report["Dimension.ORDER_NAME"][0]) + "_" + format_start_date + "-" + format_end_date + '_成效' 
 
         spreadsheet = {
             'properties': {
@@ -120,8 +129,6 @@ class GoogleSheets:
         
         return spreadsheet_id
     
-
-
     def copy_template_to_sheets(self, template_spreadsheet_id, template_sheet_id, create_spreadsheet_id):
         
         spreadsheet_id = template_spreadsheet_id # TODO: Update placeholder value.
@@ -196,14 +203,21 @@ class GoogleSheets:
     
     def default_template_sheet_column(self):
         
-        # 配合模板的版位欄位名稱      
-        Column1 = ["B","E","H","K","N","Q","T","W","Z","AC","AF","AI","AL","AO","AR","AU","AX","BA","BD","BG","BJ","BM","BP","BS","BV","BY","CB","CE","CH","CK","CN","CQ","CT","CW","CZ","DC","DF","DI","DL","DO","DR","DU","DX"]
-        Column2 = ["C","F","I","L","O","R","U","X","AA","AD","AG","AJ","AM","AP","AS","AV","AY","BB","BE","BH","BK","BN","BQ","BT","BW","BZ","CC","CF","CI","CL","CO","CR","CU","CX","DA","DD","DG","DJ","DM","DP","DS","DV","DY"]        
-        Column3 = ["D","G","J","M","P","S","V","Y","AB","AE","AH","AK","AN","AQ","AT","AW","AZ","BC","AF","BI","BL","BO","BR","BU","BX","CA","CD","CG","CJ","CM","CP","CS","CV","CY","DB","DE","DH","DK","DN","DQ","DT","DW","DZ"]   
+        # 配合模板的版位欄位名稱
+        alphabet = [chr(i) for i in range(66,91)]
+        for k in range(26):
+            k = k + 65
+            alphabet = alphabet + [chr(k)+chr(i) for i in range(65,91)]
+        alphabet.append("AAA")
+
+        Column1 = [alphabet[x] for x in range(len(alphabet)) if x%3 ==0]
+        Column2 = [alphabet[x] for x in range(len(alphabet)) if x%3 ==1]
+        Column3 = [alphabet[x] for x in range(len(alphabet)) if x%3 ==2]
+
         column_df = zip(Column1, Column2, Column3)
         column_df = pandas.DataFrame(column_df, columns = ["Column1","Column2","Column3"])
         
-        return column_df
+        return column_df    
     
     def count_campaign(self, report):
         
@@ -216,18 +230,27 @@ class GoogleSheets:
         
         # 篩選不同的報表
         report = report[report["Campaign"] == compaign_name]
-
         return report
     
     def campaign_month_count(self, campaign_report):
         
         # 算委刊項中最早和最晚日期
+        campaign_report["Month"] = campaign_report['Dimension.DATE'].apply(lambda x:x.month)
+        month_list = list(set(sorted(campaign_report['Month'])))
         early_day = campaign_report["Dimension.DATE"].min()
         last_day = campaign_report["Dimension.DATE"].max()
         days = (last_day - early_day).days
-        months = last_day.month - early_day.month + 1
+        months = last_day.month - early_day.month
+        
+        def check_year(early_day, last_day):
+            year = last_day.year - early_day.year
+            if year > 0:
+                months = 12 + months
+            return months
+        
+        months = months + 1
 
-        return early_day, days, months
+        return month_list, early_day, days, months
 
     def fill_campaign_data(self, column_df, campaign_report, early_day, days):
         
@@ -302,17 +325,10 @@ class GoogleSheets:
                 }
             update_data1.append(data)
         
-        return placement_index_df, last_column_index, update_data1   
+        return placement_index_df, last_column_index, update_data1 
     
-    def fill_month_campaign_data(self, column_df, placement_index_df, campaign_report, early_day, k, days, start_row):
-                
-        # 篩選目前的月份
-        cur_month = early_day.month + k
+    def fill_month_campaign_data(self, column_df, placement_index_df, campaign_report, cur_month, early_day, days, start_row):
 
-<<<<<<< HEAD
-
-=======
->>>>>>> 3676cd9322f5ccfeed127452017734dde64c89d8
         # 整理日期數據
         Date, Date_Format = [], []
         day = early_day
@@ -334,15 +350,15 @@ class GoogleSheets:
 
         # 合併 成效報表、版位名稱對照表、日期
         all_data = pandas.merge(campaign_report, Date_df, on = "Dimension.DATE")
-
         # 和版位名稱和版位index合併
         all_data = pandas.merge(all_data, placement_index_df, on = "版位名稱")
+        all_data = all_data.reset_index(drop=True)
 
         # 將數據轉為可放入googlesheets的格式
         update_data2 = []
         
         # 整理填入數據
-        clean_data = pandas.DataFrame(all_data.groupby(['Column1','Column2','Column3','Index'])['Column.AD_SERVER_IMPRESSIONS','Column.AD_SERVER_CLICKS'].sum().reset_index(drop=False))
+        clean_data = pandas.DataFrame(all_data.groupby(['Column1','Column2','Column3','Index'])['Column.AD_SERVER_IMPRESSIONS', 'Column.AD_SERVER_CLICKS'].sum().reset_index(drop=False))
         clean_data["Column.AD_SERVER_CTR"] = round(clean_data["Column.AD_SERVER_CLICKS"] / clean_data["Column.AD_SERVER_IMPRESSIONS"], 4)
         for j in range(len(clean_data)):
             values = []
@@ -353,7 +369,6 @@ class GoogleSheets:
                     "values":values,
                 }
             update_data2.append(data)
-        
         
         # 整理Total三欄數據
         unique_column = list(set(clean_data["Column1"]))
@@ -379,7 +394,6 @@ class GoogleSheets:
             }
         update_data2.append(data)
 
-      
         return update_data2, total_start_index, last_row_index
   
     def update_values(self, spreadsheet_id, update_data):
@@ -508,36 +522,7 @@ class GoogleSheets:
                                             fields='id, parents').execute()
     
     
-
-    def send_successful_mail(self, order_id, report, spreadsheet_url, trafficker_email):
-        
-        # 產出狀態
-        condition = "成功"
-        
-        # 客戶名稱
-        customer_name = str(report["Dimension.ORDER_NAME"][0])
-        
-        # 客戶ID
-        customer_id = str(order_id)
-
-        # 報表產生時間
-        now = datetime.datetime.now()
-        period_now = now.strftime('%Y/%m/%d %H:%M') 
-
-        # 報表抓取數據時間區間 
-        report["Dimension.DATE"] = pandas.to_datetime(report["Dimension.DATE"])
-        early_day = report["Dimension.DATE"].min()
-        last_day = report["Dimension.DATE"].max()
-        period_start = early_day.strftime('%Y/%m/%d %H:%M') 
-        period_end = last_day.strftime('%Y/%m/%d %H:%M')
-        period_time = period_start + " - " + period_end
-        
-        # 報表連結
-        spreadsheet_url = str(spreadsheet_url)
-
-        # email格式
-        period_now_subject_format = str(now.year) + str(now.month) + str(now.day)
-        email_subject = str("[成效報表]" + customer_name + "_" + period_now_subject_format + "_" + "更新" + condition)
+    def clean_trafficker_email(self, report, trafficker_email):
         
         # 預定要寄給的負責人
         trafficker_name, email = [], []
@@ -550,43 +535,15 @@ class GoogleSheets:
         pattern = r"(.*)(\s)[(](.*)[)]"
         for person in trafficker:
             result = re.findall(pattern, person)
-            trafficker_name.append(result[0][0])
-            email.append(result[0][2])
-
+            if result[0][0] not in trafficker_name:
+                trafficker_name.append(result[0][0])
+                email.append(result[0][2])
+        
         tra = zip(trafficker_name, email)
         tra_df = pandas.DataFrame(tra, columns = ["負責人","Email"]).drop_duplicates().reset_index(drop=True)
 
-        for i in range(len(tra_df)):
-            trafficker_name = str("閔慈")
-            trafficker_email = str("mhuang98331@gmail.com")
-            #trafficker_name = str(tra_df["負責人"][i])
-            #trafficker_email = str(tra_df["Email"][i])
-            email_text_body = "Dear" + trafficker_name + "：<br><br>" + "    以下為" + customer_name + "的成效報表資訊：" + "<br><br>    產出狀態：" + condition + "<br>    客戶ID：" + customer_id + "<br>    報表產生時間：" + period_now + "<br>    報表抓取數據時間區間：" + period_time + "<br>    報表連結：" + spreadsheet_url + "<br><br>Best Regards,<br>CW Robot"
-            self.sendgridMail.send(trafficker_email, email_subject, email_text_body) 
-    
-    def send_fail_mail(self, order_id, trafficker_email):
-        
-        # 產出狀態
-        condition = "失敗"
-                
-        # 客戶ID
-        customer_id = str(order_id)
+        return tra_df
 
-        # 報表產生時間
-        now = datetime.datetime.now()
-        period_now = now.strftime('%Y/%m/%d %H:%M') 
-
-        # email格式
-        period_now_subject_format = str(now.year) + str(now.month) + str(now.day)
-        email_subject = str("[成效報表]" + customer_id + "_" + period_now_subject_format + "_" + "更新" + condition)
-        
-        # 預定要寄給的負責人
-        trafficker_name, email = [], []
-        for j in trafficker_email:
-            trafficker_name = j.get("name")
-            email = j.get("email")
-            email_text_body = "Dear" + trafficker_name + "：" + "<br><br>    產出狀態：" + condition + "<br>    客戶ID：" + customer_id + "<br>    報表產生時間：" + period_now + "<br><br>Best Regards,<br>CW Robot"
-            self.sendgridMail.send(email, email_subject, email_text_body)
         
         
 

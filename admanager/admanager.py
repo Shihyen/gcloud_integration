@@ -37,23 +37,27 @@ class AdManager():
         if 'order_id' not in params:
             return None
 
-        if 'start_date' in params and 'end_date' in params:
-            start_date = datetime.datetime.strptime(
-                params['start_date'], "%Y-%m-%d").date()
-            end_date = datetime.datetime.strptime(
-                params['end_date'], "%Y-%m-%d").date()
-        else:
-            today = datetime.date.today()
-            end_date = today + datetime.timedelta(6 - today.weekday())
-            start_date = end_date - datetime.timedelta(days=6)
+        def check_future(str_date):
+            if datetime.datetime.strptime(str_date, "%Y-%m-%d") > datetime.datetime.now():
+                return datetime.date.today()
+            else:
+                return datetime.datetime.strptime(str_date, "%Y-%m-%d").date()
         
+        if 'start_date' in params and 'end_date' in params:           
+            start_date = check_future(params['start_date'])
+            end_date = check_future(params['end_date'])            
+            
+        else:
+            end_date = datetime.date.today() + datetime.timedelta(6 - today.weekday())
+            start_date = end_date - datetime.timedelta(days=6)
+    
         filename = self.download_order_report(
             self.cert(), params['order_id'], start_date, end_date)
 
         report = self.advertisement_report(filename)
-        googlesheets = GoogleSheets(report, end_date)
-        googlesheets.run(params)
-
+        
+        return report, start_date, end_date
+    
     def print_all_orders(self, ad_manager_client):
 
         # Initialize appropriate service.
@@ -119,10 +123,10 @@ class AdManager():
         # Create report job.
         report_job = {
             'reportQuery': {
-                'dimensions': ['LINE_ITEM_NAME', 'DATE', 'ORDER_NAME', 'CREATIVE_SIZE','AD_UNIT_NAME'],
+                'dimensions': ['LINE_ITEM_NAME', 'DATE', 'ORDER_NAME'],
                 'dimensionAttributes': ['ORDER_TRAFFICKER'],
                 'statement': statement.ToStatement(),
-                'columns': ['AD_SERVER_IMPRESSIONS', 'AD_SERVER_CLICKS', 'AD_SERVER_CTR'],
+                'columns': ['AD_SERVER_IMPRESSIONS', 'AD_SERVER_CLICKS'],
                 'startDate': start_date,
                 'endDate': end_date,
                 'customFieldIds': list(custom_field_ids)
@@ -151,29 +155,41 @@ class AdManager():
 
         return report_file.name
 
-    def advertisement_report(self, report_file):
-        # 讀取報表
-        report = pandas.read_csv(str(report_file), compression='gzip')
-
-        # 正則式 讀取版位、活動
-        ITEM = report["Dimension.LINE_ITEM_NAME"]
-        pattern = r"(([[])(.*)([]])|.*)(.*)"
-        campaign = []
-        for text in ITEM:
-            if text[0] == "[":
-                result = re.findall(pattern, text)
-                campaign.append(result[0][2])
+    def advertisement_report(self, report_file_name):
+        
+        def empty_report(report):
+            if len(report) == 0:
+                return True
             else:
-                campaign.append("成效報表")
-        report["Campaign"] = campaign
-
-        # 版位名稱
-        report["版位名稱"] =  report["Dimension.AD_UNIT_NAME"] + "\n" + report["Dimension.CREATIVE_SIZE"]
+                return False
+            
+        # 讀取檔案
+        report = pandas.read_csv(str(report_file_name), compression='gzip', error_bad_lines=False)
         
-        # 轉換Dimension.DATE格式
-        report["Dimension.DATE"] = pandas.to_datetime(report["Dimension.DATE"])
-
-        new_report = report[["Dimension.ORDER_NAME", "Dimension.DATE", "版位名稱", "Campaign",
-                                       "Column.AD_SERVER_IMPRESSIONS", "Column.AD_SERVER_CLICKS", "Column.AD_SERVER_CTR","DimensionAttribute.ORDER_TRAFFICKER"]]
+        if empty_report(report):
+            return report
         
-        return new_report
+        else: 
+            # 正則式 讀取版位、活動
+            ITEM = report["Dimension.LINE_ITEM_NAME"]
+            pattern = r"(([[])(.*)([]])|.*)(.*)"
+            advertisement, campaign = [], []
+            for text in ITEM:
+                if text[0] == "[":
+                    result = re.findall(pattern, text)
+                    campaign.append(result[0][2])
+                    advertisement.append(result[0][4].strip())
+                else:
+                    campaign.append("成效報表")
+                    advertisement.append(text)
+
+            report["版位名稱"], report["Campaign"] = advertisement, campaign
+            
+            # 轉換Dimension.DATE格式
+            report["Dimension.DATE"] = pandas.to_datetime(report["Dimension.DATE"])
+            report["Dimension.DATE"] = report["Dimension.DATE"].apply(lambda x: x.date())
+
+            new_report = report[["Dimension.ORDER_NAME", "Dimension.DATE", "版位名稱", "Campaign",
+                                "Column.AD_SERVER_IMPRESSIONS", "Column.AD_SERVER_CLICKS", "DimensionAttribute.ORDER_TRAFFICKER"]]
+
+            return new_report
